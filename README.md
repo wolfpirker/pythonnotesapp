@@ -18,7 +18,7 @@ only saved into the RAM, not the filesystem or DB)
 
 Note: instead of uploading installable files to the repository, I will just upload
 the program as Anjuta project, because I think the code would need a bit more love, 
-before this application is of considerable use for anyone.  
+before this application could be of use for anyone.  
 
 If anyone ever forks it: make sure to never upload a settings.cfg file with the 
 connection information of your MongoDB provider account! The password would be in
@@ -26,5 +26,3 @@ cleartext in the settings file!
 One of the TODO's would be to hash the password and accountname. 
 
 Currently I do not have any plans on developing this notes application any further.
-
-
