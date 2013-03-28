@@ -1,0 +1,4 @@
+@define-color my_blue #999eff;  /* symbolic name for background-color, overrides the previous "background-color" assignment.*/
+GtkWindow {
+background-color: @my_blue;  
+}

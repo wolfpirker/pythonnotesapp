@@ -1,0 +1,4 @@
+@define-color my_red #c92b3e;  /* symbolic name for background-color, overrides the previous "background-color" assignment.*/
+GtkWindow {
+background-color: @my_red;  
+}

@@ -1,0 +1,812 @@
+#!/usr/bin/python
+#
+# notesapp.py
+# Copyright (C) 2012 Wolfgang Pirker <w_pirker@gmx.de>
+# 
+# notesapp is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# notesapp is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License along
+# with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+from gi.repository import Gtk, GdkPixbuf, Gdk
+import sys
+import uuid, glob, re
+import mongo # own module, for experimental mongodb support
+import filesys # own module for all file I/O operations
+import utils
+import encryption
+#import settings
+from settings import SETTINGS
+from settings import CONFIG_FILE
+import cPickle as pickle
+
+#Comment the first line and uncomment the second before installing
+#or making the tarball (alternatively, use project variables)
+UI_FILE = "src/notesapp.ui"
+#UI_FILE = "/usr/local/share/notesapp/ui/notesapp.ui"
+	
+class STATE:
+	def __init__(self):
+	# when the programm starts load the configuration file
+# FIXME: exception handling when file doesn't exist
+		file_object = open(CONFIG_FILE, 'r')
+		settings = pickle.load(file_object)
+		self.target_settings = self.target(settings)
+		settings = pickle.load(file_object)
+		self.encryption_settings = self.encryption(settings)
+		settings = pickle.load(file_object)
+		self.saving_settings = self.saving(settings)
+		settings = pickle.load(file_object)
+		self.font_settings = self.font(settings)
+		file_object.close()
+
+	def target(self, settings):
+		"""this method yields target settings in following order: 
+			1th target, 2nd file_path, 3rd export, 4rd connection info list;
+			it's required that it first gets the settings dictionary"""
+		file_path = settings['fcbtn']#[0]
+		mongo_connection_info = None
+		if settings['rbtn'][1]:
+			target = 'mongo'
+			export = settings['cbtn'][1]
+		else:
+			target = 'filesys'	
+			export = settings['cbtn'][0]
+		if export or (target == 'mongo'):
+			mongo_connection_info = settings['e']
+		print ("target method called")
+		while True:
+			yield (target, file_path, export, mongo_connection_info)
+
+		#@classmethod # TODO: instead call the generator method
+		#def apply_target(self, settings_dict):
+		#	"""method should be called when target settings are applied,
+		#	it takes the settings dictionary"""
+		#	print ("the target settings are: " 
+		#		   + str(settings_dict))
+
+	def encryption(self, settings):
+		"""this method yields encryption settings in following order: 
+			1th encryption, 2nd migration;
+			it's required that it first gets the settings dictionary"""
+		ask_migration = False
+		encryption = settings['rbtn'][1]
+		if encryption: 
+			ask_migration = settings['cbtn'][0]
+		print ("encryption method called")
+		while True:
+			yield (encryption, ask_migration)
+
+	def saving(self, settings):
+		"""this method yields the saving behaviour setting"""
+		if settings['rbtn'][0]: # instant auto saving
+			behaviour = 0
+		elif settings['rbtn'][1]: # newline saving
+			behaviour = 1
+		else: # manual saving
+			behaviour = 2
+		print ("saving method called")
+		while True:
+			yield behaviour
+			
+	def font(self, settings):
+		"""this method yields the default font""" 
+		print ("font method called")
+		while True:
+			yield settings['fbtn'][0]
+
+	#def update_target(self, settings):
+	#	self.target_settings = target(settings)
+	#def update_encryption(self, settings):
+	#	self.encryption_settings = encryption(settings)
+	#def update_saving(self, settings=None):
+		#print "methoden: " + str(saving_settings.send())
+		#saving_settings.close()
+	#	self.saving_settings = saving(settings)
+	#def update_font(self, settings):
+	#	self.font_settings = font(settings)
+
+
+class COUNTER:
+	@property 
+	def opened_windows_counter(self):
+		"""opened_windows_counter is used to determine wheter a notes window
+		should be destroyed or hided"""
+		return 1	
+	@property
+	def opened_settings(self):
+		"""used to find out when to apply settings"""
+		return 0
+		
+class GUI:
+	def __init__(self):
+		self.save_button = False
+
+		# used module, for either filesystem IO or DB IO
+		self.mongo = mongo.APP()
+		self.IO_DICT = {'mongo': self.mongo, 'filesys': filesys}
+		self.number_of_lines = False
+		self.migrated = False
+		self.password = None
+
+		self.__cboxe_note_editable = False
+		self.initial_notebook = "Notebook"
+		self.notebookcount = 1
+
+		self.builder = Gtk.Builder()
+		self.builder.add_from_file(UI_FILE)
+		self.builder.connect_signals(self)
+
+		self.window_main = self.builder.get_object('window')
+		
+		self.txv_note = self.builder.get_object('txv_note')
+		self.txb_note = self.txv_note.get_buffer()
+		self.cboxt_note = self.builder.get_object('cboxt_note')
+		self.cboxt_selection = self.builder.get_object('cboxt_selection')
+		self.cboxt_notebook = self.builder.get_object('cboxt_notebook')
+		self.cboxe_note = self.builder.get_object('cboxe_note')
+		self.cboxe_notebook = self.builder.get_object('cboxe_notebook')
+		self.cboxe_note.set_max_length(self.max_title_len)
+
+		self.grid_innerleft = self.builder.get_object('grid_innerleft')
+
+		# load all settings
+		self.state = STATE() 
+		self.target = self.state.target_settings.next()[0]
+			
+		self.window_manage = self.builder.get_object('window_manage')	
+		self.on_manage_notebook(0) # integrates utils.LOGIC
+		
+		self.window_main.show_all()
+
+	# http://stackoverflow.com/questions/2123585/python-multiple-properties-one-setter-getter	
+	#def attrsetter(self, attr):
+	#	def set_any(self, value):
+	#		setattr(self, attr, value)
+  	#	return set_any
+		  
+	@property # TODO later: possibility to change it in the settings window
+	def max_title_len(self):
+		"""get the maximum title length"""
+		return 48
+
+	# following method is just for settings that should take effect at program start
+	#def load_settings(self):
+	#	# load all settings, and change the behaviour accodingly
+	#	if saving_settings.next() == 2:
+	#		self.enable_manual_save()
+	#	self.target = target_settings.next()[0]
+#
+#		print "the target is " + str(self.target)
+#
+#		print("encryption settings are: " + str(encryption_settings.next()))	
+
+	#@property 
+	#def target(self):
+	#	"""output object; either files or database collections"""
+	#	return self.target # mongo #"filesys" # output target
+
+	#@target.setter
+	#def target(self, value):
+	#	self._target = value
+
+	@property
+	def initial_notetitle(self):
+		return "Note"
+		
+	@property
+	def notecount(self): # TODO: count notes at a appropiate place 
+		return 1
+
+	@notecount.setter
+	def initial_notecount(self, value):
+		self.notecount = value	
+
+	@property
+	def initial_notebook(self):
+		return "Notes Collection"
+		
+	@property
+	def notebookcount(self): # TODO: count notes at a appropiate place 
+		return 1
+
+	@notebookcount.setter # TODO: Test this
+	def notebookcount(self, value):
+		self.notebookcount = value	
+		
+	def on_window_focus_in_event (self, widget, event):		
+		"""update all settings, when the window gets the focus and Settings 
+		Window was or is opened"""
+		try:
+			self.preferences_GUI.on_btn_close_clicked(0)
+		except AttributeError:
+			return 
+		self.state = STATE()
+		print "-> update settings"
+		if self.preferences_GUI.migration and not self.migrated:
+			# initiate migration
+			self.preferences_GUI = None
+			self.let_migration_happen()
+			self.migrated = True
+		#except AttributeError:
+		#	print "settings window were not opened yet"
+
+	def let_migration_happen(self):
+		self.builder.get_object('box_migration').show()
+		print ("here here")
+		# add all notebooks with checkboxes to the grid
+		# get notebooks names, for each determine wheter it's encrypted, set
+		# appropriate icon	
+		grid_migration = self.builder.get_object('grid_migration')
+
+		all_filenames = self.IO_DICT[self.target].get_all_note_filenames() 
+		# at first only one filename per notebook is needed
+		file_in_notebook_dict = {}
+		print "all filenames: " + str(all_filenames)
+		for item in all_filenames:
+			file_in_notebook_dict[item.split('_')[0]] = [item.split('_')[1]]
+		print file_in_notebook_dict
+		for i, notebook in enumerate(file_in_notebook_dict.keys()):
+			# add notebook to the Viewport
+			cbtn = Gtk.CheckButton.new()
+			grid_migration.attach(cbtn, 0, i, 1, 1)
+			entry = Gtk.Entry.new()
+			entry.set_text(notebook)
+			# is it encrypted?
+			print file_in_notebook_dict[notebook][0]
+			text = self.IO_DICT[self.target].read_object( 
+				notebook + '_' + file_in_notebook_dict[notebook][0], self.password) 
+			if encryption.check_if_encrypted(text):
+				# add key icon
+				entry.set_icon_from_stock(0, Gtk.STOCK_DIALOG_AUTHENTICATION)
+			else:
+				# add file icon
+				entry.set_icon_from_stock(0, Gtk.STOCK_FILE)
+			grid_migration.attach(entry, 1, i, 1, 1)
+			i+=1
+			entry.set_can_focus(False)
+			entry.set_icon_activatable(0, False)			
+		grid_migration.show_all()		
+
+	def on_btn_migration_proceed_clicked (self, button):
+		grid_migration = self.builder.get_object('grid_migration')
+
+		# check if new passwords match
+		new_password = self.builder.get_object('e_migration_new').get_text()
+		if new_password != self.builder.get_object(
+			'e_migration_confirm').get_text():
+			self.builder.get_object('infbar_warning').show()
+			return False
+			
+		i = 0
+		while True:
+			cbtn = grid_migration.get_child_at(0,i)
+			if not cbtn:
+				break
+			if cbtn.get_active():
+				entry = grid_migration.get_child_at(1,i)
+				notebook = entry.get_text()
+				failed = False # failed should be True, if validation of just
+							# recently encrypted notes fails!
+				none_text_skipped = False # True, if the decrypt_text method
+							# returns False and therefore it doesn't change a file
+				notefiles = self.IO_DICT[
+					self.target].get_notebook_filenames(notebook)
+				if entry.get_icon_stock(0) == 'gtk-file': 
+					# not encrypted, use of new password, and encrypt notes 
+					for notefile in notefiles:
+						#self.IO_DICT[self.target].get_title(notefile)
+						text = self.IO_DICT[self.target].read_object(notefile)	
+						self.IO_DICT[self.target].write_object(notefile, text, new_password)	
+						
+						# Note: following validation maybe redundant 
+						# -> makes it a bit slower
+						#encrypted_text = self.IO_DICT[self.target].read_object(notefile)
+						#if not encryption.decrypt_text(encrypted_text, new_password):
+						#	failed = True
+						#	self.builder.get_object('infbar_error').show()
+							
+					# change left icon 
+					entry.set_icon_from_stock(0, Gtk.STOCK_DIALOG_AUTHENTICATION)
+
+				else: # already encrypted notebook 
+					# use of current password, validate password and then
+					# decrypt using current and encrypt using new password
+					for notefile in notefiles:
+						encrypted_text = self.IO_DICT[self.target].read_object(
+							notefile)
+						current_pw = self.builder.get_object(
+							'e_migration_current').get_text()
+						if not encryption.decrypt_text(
+							encrypted_text, current_password):
+								# so entered password must be wrong!
+								entry.set_icon_from_stock(1, Gtk.STOCK_WARNING)
+						else: # password validation worked
+							text = encryption.decrypt_text(encrypted_text, current_pw)
+							if text:
+								self.IO_DICT[self.target].write_object(
+									notefile, text, new_password)
+								#entry.set_icon_from_stock(1, Gtk.STOCK_APPLY)
+							else:
+								none_text_skipped = True
+
+						# Note: following validation maybe redundant 
+						# -> makes it a bit slower
+						#encrypted_text = self.IO_DICT[self.target].read_object(notefile)
+						#if not encryption.decrypt_text(encrypted_text, new_password):
+						#	failed = True
+						#	self.builder.get_object('infbar_error').show()
+
+				# set the second icon of a notebook
+				if failed:
+					entry.set_icon_from_stock(1, Gtk.STOCK_ERROR)
+				elif none_text_skipped:
+					entry.set_icon_from_stock(1, Gtk.STOCK_WARNING)
+				else:
+					entry.set_icon_from_stock(1, Gtk.STOCK_APPLY)
+		
+				entry.set_icon_activatable(1, False)
+			i += 1
+		grid_migration.show_all()	
+
+	def on_btn_migration_close_clicked (self, button):
+		self.builder.get_object('box_migration').hide()		
+
+	def entry_hide(self, widget, tooltip):
+		if widget.get_visibility():
+			widget.set_visibility(False)
+			widget.set_tooltip_text(tooltip)
+			widget.set_text('')
+
+	def on_btn_check_clicked (self, button):
+		password = self.builder.get_object('e_encryption_pw1').get_text()
+		e_encryption_pw2 = self.builder.get_object('e_encryption_pw2')
+		infbar = self.builder.get_object('infbar_pw_warning')
+		infbar.hide()
+		infbar_success = self.builder.get_object('infbar_pw_success')
+		infbar_success.hide()
+		infbar_label = self.builder.get_object('lbl_pw_warning')
+		if e_encryption_pw2.get_visible():
+			password2 = e_encryption_pw2.get_text()
+			if password2 != password:
+				infbar_label.set_text('Passwords do not match! Please correct it.')
+				infbar.show()
+				return False
+		filename = self.IO_DICT[self.target].get_notebook_filenames(
+			self.notebook)[0]
+		enc_text = self.IO_DICT[self.target].read_object(filename)
+		try:
+			decryption_success = encryption.decrypt_text(enc_text, password)
+		except TypeError: # TODO: needs more Testing!
+			decryption_success = encryption.decrypt_text(enc_text[:-1], password)
+		if not decryption_success:
+			infbar_label.set_text('Password wrong! Please try again!')
+			infbar.show()
+			return False
+		else:
+			infbar_success.show()
+			self.password = password
+			# update the title_filename dict with decrypted titles
+			# and show it in the notes combobox
+			self.title_filename_dict = self.logic.create_title_filename_dict(
+				self.notebook, password)
+			self.builder.get_object('grid_encrypted_notebook').hide()
+			# put it into the combo box text
+			for title in self.title_filename_dict:
+				self.cboxt_note.insert(0,"", title)
+				self.cboxt_selection.insert(0,"", title)
+			
+			
+			
+						
+			
+	def on_e_encryption_pw1_activate (self, entry):
+		e_encryption_pw2 = self.builder.get_object('e_encryption_pw2')
+		if e_encryption_pw2.get_visible():
+			e_encryption_pw2.grab_focus()
+		else:
+			self.on_btn_check_clicked (True)
+			
+	def on_e_encryption_pw2_activate (self, entry):	
+		self.on_btn_check_clicked (True)
+			
+	def on_e_migration_current_grab_focus (self, widget):
+		self.entry_hide(widget, 'enter current password')
+
+	def on_e_migration_new_grab_focus (self, widget):
+		self.entry_hide(widget, 'enter new password')
+
+	def on_e_migration_confirm_grab_focus (self, widget):
+		self.entry_hide(widget, 'confirm new password')
+
+	def message_dialog(self, window, buttons, message):
+		error_message = Gtk.MessageDialog(window, 
+		Gtk.DialogFlags.DESTROY_WITH_PARENT, Gtk.MessageType.WARNING, 
+		buttons, message)
+		error_message.set_default_response(1)
+		error_message.run()
+		error_message.destroy()
+
+	def on_txb_note_changed (self, txb_note): 
+		text = self.txb_note.get_property('text')
+		if self.state.saving_settings.next() ==0: # just call save_note -> instant save
+			self.logic.save_note(self.filename, text)
+			try: # FIXME: doesn'T work!!!
+				self.save_button.destroy()
+			except AttributeError:
+				None
+		elif self.state.saving_settings.next() ==1: # save when linecount changes
+			lines = self.txb_note.get_line_count()
+			if self.number_of_lines != lines:
+				self.logic.save_note(self.filename, text)
+				self.number_of_lines = lines
+			try: # FIXME: doesn'T work!!!
+				self.save_button.destroy()
+			except AttributeError:
+				None
+		else: # manual save
+			self.enable_manual_save()
+				
+	# rename notes:
+	def on_cboxe_note_icon_press (self, entry, entryiconposition, event):
+		if entryiconposition == 0:
+			self.active = self.cboxt_note.get_active() 
+			self.cboxe_note.set_can_focus(1)
+			self.cboxe_note.grab_focus()
+			self.cboxt_selection.set_can_focus(0)
+			self.cboxt_selection.set_can_focus(0)
+		else: 
+			can_focus = self.cboxe_note.get_can_focus()
+			# 1st: can_focus, 2nd: duplicate_title
+			CASE_DICT = {(1,1):3, (1,0):2, (0,1):1, (0,0):0}
+			duplicate_title = self.title_filename_dict.has_key(
+				self.cboxe_note.get_text())
+			if CASE_DICT[(can_focus, duplicate_title)] == 2:
+				self.cboxe_note.set_can_focus(0)
+				self.txv_note.grab_focus()
+				# update title-file dict 
+				try:
+					del(self.title_filename_dict[self.notetitle])
+				except KeyError: # can happen when new notebook with note was created
+					None
+				self.notetitle = self.cboxe_note.get_text()	
+				self.title_filename_dict[self.notetitle] = self.filename
+				# update cboxt_note
+				self.cboxt_note.remove (self.active)
+				self.cboxt_note.insert_text(self.active, self.notetitle)
+				# set title in textbuffer
+				iterstart = self.txb_note.get_iter_at_line(0)
+				iterend = self.txb_note.get_iter_at_line(1)
+				self.txb_note.delete(iterstart, iterend)
+				self.txb_note.insert(iterstart, self.notetitle+'\n', len(self.notetitle+'\n'))
+				# write whole text to file
+				current_cursor = self.txb_note.get_property('cursor-position')
+				iter_at_cursor = self.txb_note.get_iter_at_offset(current_cursor)
+				self.txv_note.set_sensitive(0) # maybe optional
+				self.txb_note.set_modified (False) # in the API recommended
+				#io_o = self.IO_DICT[self.target].io_o_open(self.filename, 'w')
+				text = self.txb_note.get_property('text')
+				if not self.IO_DICT[self.target].write_object(
+					self.filename, text):
+						print("writing process failed!!!")
+				self.txb_note.set_modified (True) 
+				self.txv_note.set_sensitive(1) # maybe optional
+				self.txb_note.place_cursor(iter_at_cursor)
+				self.txv_note.grab_focus()
+					
+			elif CASE_DICT[(can_focus, duplicate_title)] == 3:
+				question_dialog = Gtk.MessageDialog(self.window_main, 
+					Gtk.DialogFlags.DESTROY_WITH_PARENT, Gtk.MessageType.QUESTION, 
+					Gtk.ButtonsType.YES_NO,
+					"Title exists already!\nShould it really be used?")
+					# FIXME: only works if it's the same note
+				if question_dialog.run() == Gtk.ResponseType.YES:
+					self.cboxe_note.set_can_focus(0)
+					self.txv_note.grab_focus()
+				question_dialog.destroy()
+			else:
+				print("ups, click edit first")
+
+	def on_cboxe_note_activate (self, entry):
+		self.on_cboxe_note_icon_press (0, 1, 0)	
+
+
+	def on_cboxe_notebook_activate (self, entry):
+		self.on_cboxe_notebook_icon_press (0, 1, 0)
+
+	# rename notebooks:
+	def on_cboxe_notebook_icon_press (self, entry, entryiconposition, event):
+		if entryiconposition == 0:
+			self.notebook = self.cboxt_notebook.get_active_text()
+			self.cboxe_notebook.set_can_focus(1)
+			self.cboxe_notebook.grab_focus()
+			#if not self.notebook: 
+				# self.notebook should be None if no notebook was selected!
+			#	self.notebook = (self.initial_notebook+repr(self.notebookcount))
+			#	self.notebookcount+=1 				
+				
+		else: 
+			notebook_set = self.logic.fetch_notebooktitles()
+			new_title = self.cboxe_notebook.get_text()
+			if new_title in notebook_set:
+				question_dialog = Gtk.MessageDialog(self.window_main, 
+					Gtk.DialogFlags.DESTROY_WITH_PARENT, Gtk.MessageType.QUESTION, 
+					Gtk.ButtonsType.YES_NO,
+					"Title exists already! Should it really be used?\n"
+					"Hint: Notes can be merged to one\nsingle Notebook"
+					" via the rename mechanism")
+					# FIXME: doesn't check if note titles of different notebooks
+					# are the same -> in this case it must be handled somehow
+				if question_dialog.run() == Gtk.ResponseType.YES:
+					# rename notebook files
+					self.IO_DICT[self.target].rename_notebook_files(
+						self.notebook, new_title)
+					# update title_filename dict and cboxt_notebook
+					self.logic.fetch_notebooktitles()
+					self.cboxe_notebook.set_can_focus(0)
+					self.title_filename_dict = (
+						self.logic.create_title_filename_dict(new_title) )
+					self.cboxt_selection.grab_focus()
+					# self.notetitle = self.cboxe_notebook.get_text()
+				question_dialog.destroy()
+			else: # Note: doesn't include the case when a new notebook was created!
+					# this must be handled in the IO module
+				# rename notebook files
+				self.IO_DICT[self.target].rename_notebook_files(
+					self.notebook, new_title)
+				# update title_filename dict and cboxt_notebook
+				self.logic.fetch_notebooktitles()
+				self.cboxe_notebook.set_can_focus(0)
+				self.title_filename_dict = (
+					self.logic.create_title_filename_dict(new_title) )
+				self.cboxt_selection.grab_focus()
+				self.notetitle = self.cboxe_notebook.get_text()
+
+	# create new notebook
+	def on_btn_new_clicked (self, button):
+		self.builder.get_object('infbar_pw_warning').hide()
+		self.builder.get_object('infbar_pw_success').hide()
+		self.notebook = None
+		self.password = None
+		self.on_cboxe_notebook_icon_press(-1, 0, 0)	
+		if self.helper.enable_encryption:
+			self.builder.get_object('grid_when_new_notebook').show()
+
+	#def load_notebook(self, notebook): # it's not needed somewhere, or is it??
+	#	notes_list = glob.glob('*.note')
+
+	def enable_manual_save(self):
+		self.add_button_to_grid(self.grid_innerleft, 
+			Gtk.STOCK_SAVE, 0, 0, 'save')
+		self.save_button = True
+
+	def add_button_to_grid (self, grid, stock, x, y, tooltip):
+		if not self.save_button:
+			self.save_button = Gtk.Button.new()
+			image = Gtk.Image()
+			image.set_from_stock(stock,4)
+			self.save_button.set_alignment(0.0, 0.0)
+			self.save_button.set_tooltip_text(tooltip)
+			self.save_button.add(image)
+			
+		# dictionary purpose: declaration of the button clicked signal
+  		# add more to the dictionary, when more buttons are needed
+			method = {'save': self.on_save_clicked}
+			self.save_button.connect_after('clicked', method['save']) 
+
+			# add and show button
+			self.grid_innerleft.attach(self.save_button, x, y, 1, 1)
+			self.grid_innerleft.show_all()
+
+	def on_save_clicked (self, button):
+		text = self.txb_note.get_property('text')
+		self.logic.save_note(self.filename, text)
+			
+	# shared method: none	
+	def on_add_note (self, button):
+		uid = uuid.uuid4()
+
+		#try:
+		#	self.IO_DICT[self.target].io_o_close(io_o)
+		#except AttributeError:
+		#	None
+		self.filename = self.notebook + '_' + str(uid) + '.note'
+		
+		self.notetitle = self.initial_notetitle + ' ' + repr(self.notecount)
+		# update title-file dict
+		self.title_filename_dict[self.notetitle] = self.filename # TODO: hash changes?
+		
+		self.cboxt_note.insert(0,"", self.notetitle)
+		self.cboxt_note.set_active(0) 
+		self.notecount+=1
+		self.txb_note.set_text(self.notetitle)
+		text = self.txb_note.get_property('text')
+		if not self.IO_DICT[self.target].write_object(
+					self.filename, text):
+						print("writing process failed!!!")
+		
+	def on_cboxt_notebook_changed (self, combobox):
+		#if self.cboxe_notebook.get_can_focus(): # why????
+		#	return
+		self.builder.get_object('e_encryption_pw2').hide()
+		self.builder.get_object('infbar_pw_warning').hide()
+		self.builder.get_object('infbar_pw_success').hide()
+		self.password = None
+		self.builder.get_object('cboxt_selection').set_sensitive(True)
+		self.notebook = self.cboxt_notebook.get_active_text()
+		# get note titles
+		self.title_filename_dict = self.logic.create_title_filename_dict(
+			self.notebook)
+		self.cboxt_note.remove_all() 
+		self.cboxt_selection.remove_all()		
+		if self.state.encryption_settings.next()[0]:
+			filename = self.title_filename_dict.values()[0]
+			text = self.IO_DICT[self.target].read_object(filename) 
+			if encryption.check_if_encrypted(text):
+				self.builder.get_object('grid_encrypted_notebook').show()
+			else:
+				self.builder.get_object('grid_encrypted_notebook').hide()
+				# put it into the combo box text
+				for title in self.title_filename_dict:
+					self.cboxt_note.insert(0,"", title)
+					self.cboxt_selection.insert(0,"", title)
+
+	def on_e_encryption_pw1_grab_focus (self, widget):
+		if widget.get_text() == 'password':
+			self.builder.get_object('btn_show').set_sensitive(True)
+			widget.set_visibility(False)
+			widget.set_text('')
+
+	def on_e_encryption_pw2_grab_focus (self, widget):
+		if widget.get_text() == 'confirm password':
+			widget.set_visibility(False)
+			widget.set_text('')
+			
+	def on_btn_show_clicked (self, button):
+		e_encryption = self.builder.get_object('e_encryption_pw1')
+		if not e_encryption.get_visibility():
+			e_encryption.set_visibility(True)
+			button.set_label('hide')
+		else:
+			e_encryption.set_visibility(False)
+			button.set_label('show')
+					
+
+	def on_remove_note (self, button):
+		# TODO: make sure there are at least 2 notes		
+		# TODO make sure ComboBoxText is still usable afterwards!
+		current = self.cboxt_note.get_active()
+		self.cboxt_note.remove(current) 
+		self.IO_DICT[self.target].remove_file(self.filename) 
+		self.cboxt_note.set_active(0)
+		# TODO: now load the first note...
+		
+	def on_cboxt_note_changed (self, combobox):
+		cbox_note_editable = self.cboxe_note.get_can_focus()
+		self.number_of_lines = self.txb_note.get_line_count()
+		if not cbox_note_editable: 
+			self.notetitle = self.cboxe_note.get_text()
+			if self.notetitle: # this condition checking could be redundant later!
+				#try:
+				#	self.close_io_object()
+				#except AttributeError:
+				#	None
+				#try: 
+				#	self.title_filename_dict[self.notetitle]
+				#except KeyError: 
+				#	print("1st exception below notesapp.py on_cboxt_note_changed!")
+				#finally: 
+				self.filename = self.title_filename_dict[self.notetitle]
+				try:
+					text = self.IO_DICT[self.target].read_object(self.filename) 
+					self.txb_note.set_text(text, len(text))
+				except IOError, UnboundLocalError: # might happen when new notebook was recently added
+					None
+
+	def on_new_win_activate (self, menuitem):
+		try:
+			counter = COUNTER.opened_windows_counter.fget('opened_windows_counter')+1
+		except AttributeError: # when a third window is opened
+			counter = COUNTER.opened_windows_counter+1
+		COUNTER.opened_windows_counter = counter
+		GUI()		
+					
+	def on_manage_notebook (self, menuitem):
+		# get LOGIC class components:
+		self.logic = utils.LOGIC(self.cboxt_notebook, self.txb_note,
+			self.txv_note, self.state.target_settings.next()[0])
+		self.cboxt_note.set_sensitive(0)
+		self.txv_note.set_sensitive(0)
+		self.title_filename_dict = {}
+		self.window_manage.show_all()
+		self.window_manage.set_keep_above(1)
+		# now get the existing notebooks
+		self.logic.fetch_notebooktitles()
+
+	def on_settings_activate (self, menuitem):
+		self.migrated = False
+		try:
+			self.preferences_GUI.widgets_visibility_and_first_settings()
+		except AttributeError:
+			self.preferences_GUI = SETTINGS()		
+		
+		# delete notebook with all its notes
+	def on_btn_delete_clicked (self, button):
+		question_dialog = Gtk.MessageDialog(self.window_main, 
+					Gtk.DialogFlags.DESTROY_WITH_PARENT, Gtk.MessageType.QUESTION, 
+					Gtk.ButtonsType.YES_NO,
+					"Remove this notebook with all its notes, really?")
+		
+		if question_dialog.run() == Gtk.ResponseType.YES:
+			file_list = glob.glob(self.notebook + '_*.note') # FIXME: outsource this IO 
+			for item in file_list:							# specific code
+				self.IO_DICT.remove_file(item)
+		question_dialog.destroy()
+		self.logic.fetch_notebooktitles()
+		self.cboxt_notebook.set_active(0)
+		
+	def on_btn_ok_clicked (self, button):
+		try: 
+			self.notebook
+		except AttributeError:
+			# note: message dialog widget must be a Top Level Window, Not a Popup!
+			self.message_dialog(self.window_manage, Gtk.ButtonsType.OK,
+				"Please choose a notebook first!")
+			return
+		active = self.cboxt_selection.get_active() 
+		self.window_manage.hide()
+		self.txv_note.set_sensitive(1)
+		self.cboxt_note.set_sensitive(1)
+		self.cboxt_note.set_active(active)
+		self.window_main.present()
+		self.txv_note.grab_focus()
+		self.builder.get_object('grid_when_new_notebook').hide()		
+
+	def on_rbtn_yes_toggled (self, togglebutton):
+		self.builder.get_object('grid_encrypted_notebook').show()
+
+	def on_rbtn_no_toggled (self, togglebutton):
+		self.builder.get_object('grid_encrypted_notebook').hide()
+		
+			
+	def on_export_note (self, menuitem):
+		return
+
+	def on_undo_step (self, menuitem):
+		return
+
+	def on_redo_step (self, menuitem):
+		return
+
+	def on_close_app (self, menuitem):
+		# FIXME: 
+		try: # for the first time it takes it like this:
+			count = COUNTER.opened_windows_counter.fget(
+				'opened_windows_counter')-1
+		except AttributeError: # then it would raise a AttributeError
+			count = COUNTER.opened_windows_counter-1
+		COUNTER.opened_windows_counter = count
+		if not COUNTER.opened_windows_counter: 
+			Gtk.main_quit()
+		self.window_main.hide()
+
+	def on_quit_activate (self, menuitem):
+		Gtk.main_quit()
+		
+	def destroy(window, self):
+		window.on_close_app(0)
+
+def main():
+	app = GUI()
+	Gtk.main()
+		
+if __name__ == "__main__":
+    sys.exit(main())

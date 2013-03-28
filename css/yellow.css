@@ -1,0 +1,12 @@
+@define-color my_yellow #FFE680;  /* symbolic name for background-color, overrides the previous "background-color" assignment.*/
+GtkWindow {
+background-color: @my_yellow;
+/*font: Cantarell 11*/
+color: blue;
+border: 2px
+}
+
+/*
+TODO: widgets TextBuffer needs background color, and TextEntry, Buttons
+TitleBar, 
+*/

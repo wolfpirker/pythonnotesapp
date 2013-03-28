@@ -1,0 +1,4 @@
+@define-color dark_color #201825;  /* symbolic name for background-color, overrides the previous "background-color" assignment.*/
+GtkWindow {
+background-color: @dark_color;  
+}

@@ -1,0 +1,4 @@
+@define-color bright_color #fff2f2;  /* symbolic name for background-color, overrides the previous "background-color" assignment.*/
+GtkWindow {
+background-color: @bright_color;  
+}
